@@ -17,9 +17,9 @@ class TestUtils(unittest.TestCase):
         byte3 = 0b_0_010_0100
         _mask = 0b_0_111_1111
 
-        expectedValue = (byte3 & _mask) << 7
+        expectedValue = (byte1 & _mask) << 7
         expectedValue = (expectedValue | (byte2 & _mask)) << 7
-        expectedValue = expectedValue | (byte1 & _mask)
+        expectedValue = expectedValue | (byte3 & _mask)
 
         result = huffman_varint(bytes([byte1, byte2, byte3]))
         self.assertEqual(3, result.length)

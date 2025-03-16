@@ -125,11 +125,11 @@ class BTreePage:
     def cells(self) -> Iterable[AnyBTreeCell]:
         asc_sorted_cell_pointers = sorted(self._cell_pointers())
 
-        for cell_pointer, cell_end in zip(
+        for cell_start, cell_end in zip(
             asc_sorted_cell_pointers,
             [*asc_sorted_cell_pointers[1:], len(self._page_data)],
         ):
-            raw_bytes = BytesOffsetArray(self._page_data[cell_pointer:cell_end])
+            raw_bytes = BytesOffsetArray(self._page_data[cell_start:cell_end])
 
             match self.header.page_type:
                 case PageType.LEAF_TABLE:
@@ -140,3 +140,17 @@ class BTreePage:
                     yield TableBTreeInteriorCell.create(raw_bytes)
                 case PageType.INTERIOR_INDEX:
                     yield IndexBTreeInteriorCell.create(raw_bytes)
+
+
+class OverflowPage:
+    def __init__(self, page_data: bytes) -> None:
+        next_page_number = int.from_bytes(
+            page_data[:4],
+            byteorder="big",
+            signed=False,
+        )
+
+        self.next_overflow_page: Final[int | None] = (
+            next_page_number if next_page_number != 0 else None
+        )
+        self.overflow_data: Final[bytes] = page_data[4:]

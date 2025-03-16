@@ -24,9 +24,8 @@ def huffman_varint(bytes: bytes) -> HuffmanResult:
     )
 
     value, length = 0, last_varint_byte_index + 1
-    for byte in reversed(bytes[:length]):
-        value <<= 7
-        value |= 0b_0111_1111 & byte
+    for byte in bytes[:length]:
+        value = (value << 7) | (0b_0111_1111 & byte)
 
     return HuffmanResult(value, length)
 

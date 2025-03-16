@@ -6,8 +6,8 @@ from os import fstat, PathLike
 
 from .table import Table
 from .cell import TableBTreeInteriorCell, TableBTreeLeafCell
-from .page import BTreePage, PageType
-from .utils import BytesOffsetArray, OffsetMetadata
+from .page import BTreePage, OverflowPage, PageType
+from .utils import OffsetMetadata
 
 
 @final
@@ -82,25 +82,33 @@ class SQLiteDatabase:
             if remainder != 0:
                 raise ValueError("Page size needs to be a power of 2")
 
-    def _page(self, page_number: int) -> BTreePage:
+    def _read_page_data(self, page_number: int) -> bytes:
         if page_number < 1:
             raise ValueError("Pages are numbered from 1")
         if page_number > (count := self._pages_count):
-            raise ValueError(f"Max page number is {count}")
+            raise ValueError(f"Max page number is {count}, but {page_number} requested")
 
         page_size = self.page_size
         absolute_page_start = page_size * (page_number - 1)
 
         _ = self._file.seek(absolute_page_start)
-        page_bytes = BytesOffsetArray(self._file.read(page_size))
+        page_bytes = self._file.read(page_size)
 
-        return BTreePage(page_data=page_bytes, page_number=page_number)
+        return page_bytes
+
+    def _btree_page(self, page_number: int) -> BTreePage:
+        page_data = self._read_page_data(page_number)
+        return BTreePage(page_data=page_data, page_number=page_number)
+
+    def _overflow_page(self, page_number: int) -> OverflowPage:
+        page_data = self._read_page_data(page_number)
+        return OverflowPage(page_data=page_data)
 
     def _table_cells_tree(
         self,
         starting_page_number: int,
     ) -> Iterator[TableBTreeLeafCell]:
-        page = self._page(page_number=starting_page_number)
+        page = self._btree_page(page_number=starting_page_number)
 
         match page.header.page_type:
             case PageType.INTERIOR_TABLE:
@@ -112,12 +120,28 @@ class SQLiteDatabase:
                     yield from self._table_cells_tree(cell.left_pointer)
             case PageType.LEAF_TABLE:
                 leaf_cells = cast(Iterator[TableBTreeLeafCell], page.cells())
-                for cell in leaf_cells:
-                    yield cell
+                yield from leaf_cells
             case _:
                 raise ValueError
 
     def tables(self) -> Iterator[Table]:
-        for cell in self._table_cells_tree(starting_page_number=1):
-            _ = cell
+        for leaf_cell in self._table_cells_tree(starting_page_number=1):
+            remaining_bytes = leaf_cell.payload_size - len(leaf_cell.initial_payload)
+
+            full_payload = leaf_cell.initial_payload
+            next_overflow_page = leaf_cell.overflow_page
+
+            while remaining_bytes > 0 and next_overflow_page is not None:
+                overflow_page = self._overflow_page(next_overflow_page)
+                data_chunk = overflow_page.overflow_data[:remaining_bytes]
+
+                full_payload += data_chunk
+                remaining_bytes -= len(data_chunk)
+                next_overflow_page = overflow_page.next_overflow_page
+
+            if leaf_cell.payload_size != len(full_payload):
+                raise ValueError(
+                    f"Expected {leaf_cell.payload_size}, but got {len(full_payload)}"
+                )
+
             yield Table()
