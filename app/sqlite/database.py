@@ -188,3 +188,15 @@ class SQLiteDatabase:
                 self.header().encoding,
             )
             yield schema_table
+
+    def total_row_count(self, table_name: str):
+        table_root_page = next(
+            schema_table.root_page
+            for schema_table in self.schema_tables()
+            if schema_table.tbl_name == table_name
+        )
+        if not table_root_page:
+            raise ValueError
+
+        rows = list(self._table_cells_tree(starting_page_number=table_root_page))
+        return len(rows)

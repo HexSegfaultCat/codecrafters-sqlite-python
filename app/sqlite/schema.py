@@ -22,16 +22,8 @@ class SchemaTable:
 
     @staticmethod
     def from_payload(payload: BytesOffsetArray, encoding: str):
-        header_size_varint = huffman_varint(payload[:9])
-        header, body = (
-            BytesOffsetArray(payload[: header_size_varint.value]),
-            BytesOffsetArray(payload[header_size_varint.value :]),
-        )
-
         object_type, object_name, table_name, root_page, sql, *rest = parse_records(
-            header_bytes=header,
-            header_offset=header_size_varint.length,
-            body_bytes=body,
+            payload
         )
         if (
             len(rest) > 0

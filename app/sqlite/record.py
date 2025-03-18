@@ -61,14 +61,17 @@ def _parse_header(value: int) -> tuple[SerialType, int]:
             raise ValueError
 
 
-def parse_records(
-    header_bytes: BytesOffsetArray,
-    header_offset: int,
-    body_bytes: BytesOffsetArray,
-) -> list[Record]:
-    records: list[Record] = []
+def parse_records(payload: bytes) -> list[Record]:
+    header_size_varint = huffman_varint(payload[:9])
+    header_bytes, body_bytes = (
+        BytesOffsetArray(payload[: header_size_varint.value]),
+        BytesOffsetArray(payload[header_size_varint.value :]),
+    )
 
+    header_offset = header_size_varint.length
     body_offset = 0
+
+    records: list[Record] = []
     while header_offset < len(header_bytes):
         header_varint = huffman_varint(
             header_bytes.subbytes(offset=header_offset, length=9),
