@@ -38,4 +38,4 @@ with SQLiteDatabase(database_file_path) as database:
                 if type(result) is int:
                     print(result)
                 elif type(result) is list:
-                    print(", ".join(result))
+                    print("|".join(result))
