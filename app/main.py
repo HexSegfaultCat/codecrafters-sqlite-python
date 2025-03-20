@@ -1,6 +1,7 @@
 import sys
 
 from .sqlite import SQLiteDatabase
+from .parse_util import basic_parse_sql
 
 
 database_file_path = sys.argv[1]
@@ -25,14 +26,16 @@ with SQLiteDatabase(database_file_path) as database:
             print(f"Invalid command: {command}")
 
         case False, sql:
-            statements = sql.split(" ")
+            columns, count_rows, table_name = basic_parse_sql(sql)
 
-            assert len(statements) == 4
-            assert statements[0].upper() == "SELECT"
-            assert statements[1].upper() == "COUNT(*)"
-            assert statements[2].upper() == "FROM"
+            result_iterator = database.query(
+                table_name.value,
+                selected_columns=columns,
+                count_rows=count_rows,
+            )
 
-            table_name = statements[3]
-
-            rows_count = database.total_row_count(table_name)
-            print(rows_count)
+            for result in result_iterator:
+                if type(result) is int:
+                    print(result)
+                elif type(result) is list:
+                    print(", ".join(result))

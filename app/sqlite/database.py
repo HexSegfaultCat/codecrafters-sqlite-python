@@ -4,7 +4,11 @@ from typing import BinaryIO, cast, final
 
 from os import fstat, PathLike
 
+import sqlparse
+from sqlparse.sql import IdentifierList, Parenthesis, Token
+
 from .schema import SchemaTable
+from .record import parse_records
 from .cell import TableBTreeInteriorCell, TableBTreeLeafCell
 from .page import BTreePage, OverflowPage, PageType
 from .utils import BytesOffsetArray, OffsetMetadata
@@ -189,14 +193,57 @@ class SQLiteDatabase:
             )
             yield schema_table
 
-    def total_row_count(self, table_name: str):
-        table_root_page = next(
-            schema_table.root_page
+    def query(
+        self,
+        table_name: str,
+        selected_columns: list[str],
+        count_rows: bool = False,
+    ):
+        table_schema = next(
+            schema_table
             for schema_table in self.schema_tables()
             if schema_table.tbl_name == table_name
         )
-        if not table_root_page:
-            raise ValueError
+        if not table_schema.root_page:
+            raise ValueError(f"Table {table_name} not found in the database")
 
-        rows = list(self._table_cells_tree(starting_page_number=table_root_page))
-        return len(rows)
+        row_leaf_cells = self._table_cells_tree(
+            starting_page_number=table_schema.root_page
+        )
+        if count_rows:
+            yield len(list(row_leaf_cells))
+            return
+
+        sql_tokens: list[Token] = [
+            token
+            for token in cast(list[Token], sqlparse.parse(table_schema.sql)[0].tokens)
+            if not token.is_whitespace and not token.is_newline
+        ]
+
+        schema_column_names: list[str] = []
+        if isinstance(parenthesis_token := sql_tokens[-1], Parenthesis):
+            for token in cast(Iterator[Token], parenthesis_token.get_sublists()):
+                if isinstance(token, IdentifierList):
+                    identifiers = cast(Iterator[Token], token.get_identifiers())
+                    token = list(identifiers)[-1]
+
+                schema_column_names.append(token.value)
+
+        selected_column_indices: list[int] = []
+        for selected_column in selected_columns:
+            if selected_column not in schema_column_names:
+                raise ValueError(
+                    f"Column {selected_column} does not exist in table {table_name}"
+                )
+            selected_column_indices.append(schema_column_names.index(selected_column))
+
+        encoding = self.header().encoding
+        for leaf_cell in row_leaf_cells:
+            payload = self._load_full_payload(leaf_cell)
+            row_record = parse_records(payload)
+
+            result: list[str] = []
+            for index in selected_column_indices:
+                result.append(row_record[index].data.decode(encoding))
+
+            yield result

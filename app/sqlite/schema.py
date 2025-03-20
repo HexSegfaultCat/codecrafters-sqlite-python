@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .record import SerialType, parse_records
-from .utils import BytesOffsetArray, huffman_varint
+from .utils import BytesOffsetArray
 
 
 class SchemaObjectType(Enum):
