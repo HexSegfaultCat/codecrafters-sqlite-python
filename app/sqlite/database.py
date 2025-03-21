@@ -5,10 +5,11 @@ from typing import BinaryIO, cast, final
 from os import fstat, PathLike
 
 import sqlparse
-from sqlparse.sql import IdentifierList, Parenthesis, Token
+from sqlparse.sql import Identifier, IdentifierList, Parenthesis, Token
+from sqlparse.tokens import Literal
 
 from .schema import SchemaTable
-from .record import parse_records
+from .record import Record, SerialType, parse_records
 from .cell import TableBTreeInteriorCell, TableBTreeLeafCell
 from .page import BTreePage, OverflowPage, PageType
 from .utils import BytesOffsetArray, OffsetMetadata
@@ -193,10 +194,35 @@ class SQLiteDatabase:
             )
             yield schema_table
 
+    def _extract_columns(self, table_sql: str, selected_columns: list[str]):
+        sql_tokens: list[Token] = [
+            token
+            for token in cast(list[Token], sqlparse.parse(table_sql)[0].tokens)
+            if not token.is_whitespace and not token.is_newline
+        ]
+
+        schema_column_names: list[str] = []
+        if isinstance(parenthesis_token := sql_tokens[-1], Parenthesis):
+            for token in cast(Iterator[Token], parenthesis_token.get_sublists()):
+                if isinstance(token, IdentifierList):
+                    identifiers = cast(Iterator[Token], token.get_identifiers())
+                    token = list(identifiers)[-1]
+
+                schema_column_names.append(token.value)
+
+        selected_column_indices: list[int] = []
+        for selected_column in selected_columns:
+            if selected_column not in schema_column_names:
+                raise ValueError(f"Column {selected_column} does not exist")
+            selected_column_indices.append(schema_column_names.index(selected_column))
+
+        return schema_column_names, selected_column_indices
+
     def query(
         self,
         table_name: str,
         selected_columns: list[str],
+        conditions: list[tuple[Token, Token]],
         count_rows: bool = False,
     ):
         table_schema = next(
@@ -214,36 +240,52 @@ class SQLiteDatabase:
             yield len(list(row_leaf_cells))
             return
 
-        sql_tokens: list[Token] = [
-            token
-            for token in cast(list[Token], sqlparse.parse(table_schema.sql)[0].tokens)
-            if not token.is_whitespace and not token.is_newline
-        ]
+        schema_column_names, selected_column_indices = self._extract_columns(
+            table_sql=table_schema.sql,
+            selected_columns=selected_columns,
+        )
+        db_encoding = self.header().encoding
 
-        schema_column_names: list[str] = []
-        if isinstance(parenthesis_token := sql_tokens[-1], Parenthesis):
-            for token in cast(Iterator[Token], parenthesis_token.get_sublists()):
-                if isinstance(token, IdentifierList):
-                    identifiers = cast(Iterator[Token], token.get_identifiers())
-                    token = list(identifiers)[-1]
+        def record_from_token(token: Token):
+            record_value: Record
+            if isinstance(token, Identifier):
+                column_index = schema_column_names.index(token.value)
+                record_value = row_record[column_index]
+            else:
+                if right_token_arg.ttype is Literal.String.Single:
+                    string_value = right_token_arg.value[1:-1]
+                    record_value = Record(
+                        type=SerialType.STRING,
+                        data=string_value.encode(db_encoding),
+                    )
+                elif right_token_arg.ttype is Literal.Number.Integer:
+                    record_value = Record(
+                        type=SerialType.INT64,
+                        data=int(right_token_arg.value).to_bytes(),
+                    )
+                else:
+                    raise ValueError(f"Unsupported value {right_token_arg.value}")
 
-                schema_column_names.append(token.value)
+            return record_value
 
-        selected_column_indices: list[int] = []
-        for selected_column in selected_columns:
-            if selected_column not in schema_column_names:
-                raise ValueError(
-                    f"Column {selected_column} does not exist in table {table_name}"
-                )
-            selected_column_indices.append(schema_column_names.index(selected_column))
-
-        encoding = self.header().encoding
         for leaf_cell in row_leaf_cells:
             payload = self._load_full_payload(leaf_cell)
             row_record = parse_records(payload)
 
+            matching_row = True
+            for left_token_arg, right_token_arg in conditions:
+                left_record_value = record_from_token(left_token_arg)
+                right_record_value = record_from_token(right_token_arg)
+
+                if left_record_value != right_record_value:
+                    matching_row = False
+                    break
+
+            if not matching_row:
+                continue
+
             result: list[str] = []
             for index in selected_column_indices:
-                result.append(row_record[index].data.decode(encoding))
+                result.append(row_record[index].data.decode(db_encoding))
 
             yield result

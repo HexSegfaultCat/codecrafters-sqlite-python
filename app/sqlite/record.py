@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
+from typing import override
 
 from .utils import BytesOffsetArray, huffman_varint
 
@@ -25,6 +26,29 @@ class SerialType(Enum):
 class Record:
     type: SerialType
     data: bytes
+
+    @property
+    def is_int(self):
+        return self.type in [
+            SerialType.INT8,
+            SerialType.INT16,
+            SerialType.INT24,
+            SerialType.INT32,
+            SerialType.INT48,
+            SerialType.INT64,
+        ]
+
+    @override
+    def __eq__(self, value: object, /) -> bool:
+        if not isinstance(value, Record):
+            return False
+
+        if self.is_int and value.is_int:
+            left_valule = int.from_bytes(self.data, byteorder="big", signed=True)
+            right_value = int.from_bytes(value.data, byteorder="big", signed=True)
+            return left_valule == right_value
+        else:
+            return self.data == value.data and self.type == value.type
 
 
 def _parse_header(value: int) -> tuple[SerialType, int]:

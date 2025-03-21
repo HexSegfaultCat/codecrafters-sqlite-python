@@ -26,11 +26,12 @@ with SQLiteDatabase(database_file_path) as database:
             print(f"Invalid command: {command}")
 
         case False, sql:
-            columns, count_rows, table_name = basic_parse_sql(sql)
+            table_name, columns, count_rows, conditions = basic_parse_sql(sql)
 
             result_iterator = database.query(
                 table_name.value,
                 selected_columns=columns,
+                conditions=conditions,
                 count_rows=count_rows,
             )
 

@@ -1,7 +1,7 @@
 from typing import cast
 
 import sqlparse
-from sqlparse.sql import Function, Identifier, IdentifierList, Token
+from sqlparse.sql import Comparison, Function, Identifier, IdentifierList, Token, Where
 from sqlparse.tokens import Wildcard
 
 
@@ -39,4 +39,26 @@ def basic_parse_sql(sql: str):
     if not table_name:
         raise ValueError("Table name is required")
 
-    return columns, count_rows, table_name
+    conditions: list[tuple[Token, Token]] = []
+    if len(sql_tokens) > 4:
+        where_token = token if isinstance(token := sql_tokens[4], Where) else None
+        if where_token:
+            for condition in where_token.get_sublists():
+                if not isinstance(condition, Comparison):
+                    raise ValueError("Only comparison operations allowed in WHERE")
+
+                condition_tokens = list(
+                    token
+                    for token in cast(list[Token], condition.tokens)
+                    if not token.is_whitespace and not token.is_newline
+                )
+                if len(condition_tokens) != 3:
+                    raise ValueError(f"Unsupported condition type {condition}")
+
+                left, operation, right = condition_tokens
+                if operation.value != "=":
+                    raise ValueError("Only equals conditions are supported")
+
+                conditions.append((left, right))
+
+    return table_name, columns, count_rows, conditions
