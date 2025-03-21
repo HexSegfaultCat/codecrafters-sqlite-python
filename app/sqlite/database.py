@@ -286,6 +286,9 @@ class SQLiteDatabase:
 
             result: list[str] = []
             for index in selected_column_indices:
-                result.append(row_record[index].data.decode(db_encoding))
+                if index == 0 and row_record[index].type == SerialType.NULL:
+                    result.append(str(leaf_cell.row_id))
+                else:
+                    result.append(row_record[index].data.decode(db_encoding))
 
             yield result

@@ -126,8 +126,9 @@ class BTreePage:
         asc_sorted_cell_pointers = sorted(self._cell_pointers())
 
         for cell_start, cell_end in zip(
-            asc_sorted_cell_pointers,
-            [*asc_sorted_cell_pointers[1:], len(self._page_data)],
+            reversed(asc_sorted_cell_pointers),
+            reversed([*asc_sorted_cell_pointers[1:], len(self._page_data)]),
+            strict=True,
         ):
             raw_bytes = BytesOffsetArray(self._page_data[cell_start:cell_end])
 
