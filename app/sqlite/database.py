@@ -2,15 +2,22 @@ from collections.abc import Iterator
 from types import TracebackType
 from typing import BinaryIO, cast, final
 
+import re
+
 from os import fstat, PathLike
 
 import sqlparse
-from sqlparse.sql import Identifier, IdentifierList, Parenthesis, Token
+from sqlparse.sql import Function, Identifier, IdentifierList, Parenthesis, Token
 from sqlparse.tokens import Literal
 
-from .schema import SchemaTable
+from .schema import SchemaObject
 from .record import Record, SerialType, parse_records
-from .cell import TableBTreeInteriorCell, TableBTreeLeafCell
+from .cell import (
+    IndexBTreeInteriorCell,
+    IndexBTreeLeafCell,
+    TableBTreeInteriorCell,
+    TableBTreeLeafCell,
+)
 from .page import BTreePage, OverflowPage, PageType
 from .utils import BytesOffsetArray, OffsetMetadata
 
@@ -152,19 +159,97 @@ class SQLiteDatabase:
 
         match page.header.page_type:
             case PageType.INTERIOR_TABLE:
-                right_page_number = cast(int, page.header.right_most_pointer)
-                yield from self._table_cells_tree(right_page_number)
-
                 interior_cells = cast(Iterator[TableBTreeInteriorCell], page.cells())
                 for cell in interior_cells:
                     yield from self._table_cells_tree(cell.left_pointer)
+
+                right_page_number = cast(int, page.header.right_most_pointer)
+                yield from self._table_cells_tree(right_page_number)
             case PageType.LEAF_TABLE:
                 leaf_cells = cast(Iterator[TableBTreeLeafCell], page.cells())
                 yield from leaf_cells
             case _:
                 raise ValueError
 
-    def _load_full_payload(self, leaf_cell: TableBTreeLeafCell):
+    def _row_ids_from_index(
+        self,
+        page_number: int,
+        lookup_value: bytes,
+    ) -> Iterator[int]:
+        page = self._btree_page(page_number=page_number)
+
+        match page.header.page_type:
+            case PageType.INTERIOR_INDEX:
+                interior_cells = cast(Iterator[IndexBTreeInteriorCell], page.cells())
+
+                for cell in interior_cells:
+                    payload = self._load_full_payload(cell)
+                    row_records = parse_records(payload)
+
+                    if lookup_value == row_records[0].data:
+                        yield from self._row_ids_from_index(
+                            cell.left_pointer,
+                            lookup_value,
+                        )
+                        yield int.from_bytes(
+                            row_records[1].data,
+                            byteorder="big",
+                            signed=False,
+                        )
+                    elif lookup_value < row_records[0].data:
+                        yield from self._row_ids_from_index(
+                            cell.left_pointer,
+                            lookup_value,
+                        )
+                        break
+                else:
+                    if right_pointer := page.header.right_most_pointer:
+                        yield from self._row_ids_from_index(right_pointer, lookup_value)
+
+            case PageType.LEAF_INDEX:
+                leaf_cells = cast(Iterator[IndexBTreeLeafCell], page.cells())
+                for cell in leaf_cells:
+                    payload = self._load_full_payload(cell)
+                    row_records = parse_records(payload)
+
+                    if row_records[0].data == lookup_value:
+                        yield int.from_bytes(
+                            row_records[1].data,
+                            byteorder="big",
+                            signed=False,
+                        )
+
+            case _:
+                raise ValueError
+
+    def _records_by_row_id(
+        self, starting_page_number: int, row_id: int
+    ) -> TableBTreeLeafCell | None:
+        page = self._btree_page(page_number=starting_page_number)
+
+        match page.header.page_type:
+            case PageType.INTERIOR_TABLE:
+                interior_cells = cast(Iterator[TableBTreeInteriorCell], page.cells())
+                for cell in interior_cells:
+                    if row_id <= cell.integer_key:
+                        return self._records_by_row_id(cell.left_pointer, row_id)
+                else:
+                    right_page_number = cast(int, page.header.right_most_pointer)
+                    return self._records_by_row_id(right_page_number, row_id)
+            case PageType.LEAF_TABLE:
+                leaf_cells = cast(Iterator[TableBTreeLeafCell], page.cells())
+                for cell in leaf_cells:
+                    if cell.row_id == row_id:
+                        return cell
+
+                return None
+            case _:
+                raise ValueError
+
+    def _load_full_payload(
+        self,
+        leaf_cell: TableBTreeLeafCell | IndexBTreeInteriorCell | IndexBTreeLeafCell,
+    ):
         remaining_bytes = leaf_cell.payload_size - len(leaf_cell.initial_payload)
 
         full_payload = leaf_cell.initial_payload
@@ -185,16 +270,19 @@ class SQLiteDatabase:
 
         return full_payload
 
-    def schema_tables(self) -> Iterator[SchemaTable]:
+    def schema_objects(self) -> Iterator[SchemaObject]:
         for leaf_cell in self._table_cells_tree(starting_page_number=1):
             full_payload = self._load_full_payload(leaf_cell)
-            schema_table = SchemaTable.from_payload(
+            schema_table = SchemaObject.from_payload(
                 BytesOffsetArray(full_payload),
                 self.header().encoding,
             )
             yield schema_table
 
     def _extract_columns(self, table_sql: str, selected_columns: list[str]):
+        keyword_replace = re.compile(re.escape("domain"), re.IGNORECASE)
+        table_sql = keyword_replace.sub('"domain"', table_sql)
+
         sql_tokens: list[Token] = [
             token
             for token in cast(list[Token], sqlparse.parse(table_sql)[0].tokens)
@@ -208,7 +296,13 @@ class SQLiteDatabase:
                     identifiers = cast(Iterator[Token], token.get_identifiers())
                     token = list(identifiers)[-1]
 
-                schema_column_names.append(token.value)
+                cleaned_value = token.value
+                if cleaned_value[0] == '"' and cleaned_value[-1] == '"':
+                    cleaned_value = cleaned_value[1:-1]
+
+                schema_column_names.append(cleaned_value)
+        else:
+            raise ValueError("Unable to parse columns")
 
         selected_column_indices: list[int] = []
         for selected_column in selected_columns:
@@ -218,6 +312,81 @@ class SQLiteDatabase:
 
         return schema_column_names, selected_column_indices
 
+    def _extract_indices(self, index_objects: list[SchemaObject]):
+        column_root_page_map: dict[str, int] = {}
+
+        for index_object in index_objects:
+            if not index_object.root_page:
+                raise ValueError
+
+            sql_tokens: list[Token] = [
+                token
+                for token in cast(
+                    list[Token], sqlparse.parse(index_object.sql)[0].tokens
+                )
+                if not token.is_whitespace and not token.is_newline
+            ]
+
+            if isinstance(function_token := sql_tokens[-1], Function) and isinstance(
+                parenthesis_token := list(function_token.get_sublists())[-1],
+                Parenthesis,
+            ):
+                for token in cast(Iterator[Token], parenthesis_token.get_sublists()):
+                    if isinstance(token, IdentifierList):
+                        identifiers = cast(Iterator[Token], token.get_identifiers())
+                        token = list(identifiers)[-1]
+
+                    column_root_page_map[token.value] = index_object.root_page
+            else:
+                raise ValueError("Unable to parse index")
+
+        return column_root_page_map
+
+    def _record_extractor(self, db_encoding: str, schema_column_names: list[str]):
+        def extract(token: Token, row_record: list[Record]):
+            record_value: Record
+            if isinstance(token, Identifier):
+                column_index = schema_column_names.index(token.value)
+                record_value = row_record[column_index]
+            else:
+                if token.ttype is Literal.String.Single:
+                    string_value = token.value[1:-1]
+                    record_value = Record(
+                        type=SerialType.STRING,
+                        data=string_value.encode(db_encoding),
+                    )
+                elif token.ttype is Literal.Number.Integer:
+                    record_value = Record(
+                        type=SerialType.INT64,
+                        data=int(token.value).to_bytes(),
+                    )
+                else:
+                    raise ValueError(f"Unsupported value {token.value}")
+
+            return record_value
+
+        return extract
+
+    def _extract_schema_table_objects(self, table_name: str):
+        related_schema_objects = (
+            schema_table
+            for schema_table in self.schema_objects()
+            if schema_table.tbl_name == table_name
+        )
+
+        table_schema = next(
+            schema_object
+            for schema_object in related_schema_objects
+            if schema_object.is_table
+        )
+        table_index_schema = [
+            schema_object
+            for schema_object in related_schema_objects
+            if schema_object.is_index
+        ]
+
+        return table_schema, table_index_schema
+
     def query(
         self,
         table_name: str,
@@ -225,57 +394,87 @@ class SQLiteDatabase:
         conditions: list[tuple[Token, Token]],
         count_rows: bool = False,
     ):
-        table_schema = next(
-            schema_table
-            for schema_table in self.schema_tables()
-            if schema_table.tbl_name == table_name
+        table_schema, table_index_schema = self._extract_schema_table_objects(
+            table_name
         )
         if not table_schema.root_page:
             raise ValueError(f"Table {table_name} not found in the database")
 
-        row_leaf_cells = self._table_cells_tree(
+        linear_row_leaf_cells = self._table_cells_tree(
             starting_page_number=table_schema.root_page
         )
         if count_rows:
-            yield len(list(row_leaf_cells))
+            yield len(list(linear_row_leaf_cells))
             return
 
+        db_encoding = self.header().encoding
         schema_column_names, selected_column_indices = self._extract_columns(
             table_sql=table_schema.sql,
             selected_columns=selected_columns,
         )
-        db_encoding = self.header().encoding
+        index_root_page_map = self._extract_indices(table_index_schema)
 
-        def record_from_token(token: Token):
-            record_value: Record
-            if isinstance(token, Identifier):
-                column_index = schema_column_names.index(token.value)
-                record_value = row_record[column_index]
+        indexable_conditions: list[tuple[Identifier, Token]] = []
+        for left_arg, right_arg in conditions:
+            is_left_identifier = isinstance(left_arg, Identifier)
+            is_right_identifier = isinstance(right_arg, Identifier)
+
+            if (is_left_identifier and is_right_identifier) or (
+                not is_left_identifier and not is_right_identifier
+            ):
+                continue
+
+            if is_left_identifier:
+                indexable_conditions.append((left_arg, right_arg))
+            elif is_right_identifier:
+                indexable_conditions.append((right_arg, left_arg))
+
+        index_condition_groups: list[list[TableBTreeLeafCell]] = []
+        for condition_identifier, condition_value in indexable_conditions:
+            if condition_identifier.value not in index_root_page_map:
+                continue
+
+            index_root_page = index_root_page_map[condition_identifier.value]
+
+            value: bytes
+            if condition_value.ttype is Literal.String.Single:
+                value = condition_value.value[1:-1].encode(db_encoding)
             else:
-                if right_token_arg.ttype is Literal.String.Single:
-                    string_value = right_token_arg.value[1:-1]
-                    record_value = Record(
-                        type=SerialType.STRING,
-                        data=string_value.encode(db_encoding),
-                    )
-                elif right_token_arg.ttype is Literal.Number.Integer:
-                    record_value = Record(
-                        type=SerialType.INT64,
-                        data=int(right_token_arg.value).to_bytes(),
-                    )
-                else:
-                    raise ValueError(f"Unsupported value {right_token_arg.value}")
+                value = int(condition_value.value).to_bytes(
+                    byteorder="big",
+                    signed=True,
+                )
 
-            return record_value
+            row_ids = self._row_ids_from_index(
+                page_number=index_root_page,
+                lookup_value=value,
+            )
 
-        for leaf_cell in row_leaf_cells:
+            filtered_cells: list[TableBTreeLeafCell] = []
+            for id in row_ids:
+                if cell := self._records_by_row_id(table_schema.root_page, id):
+                    filtered_cells.append(cell)
+
+            index_condition_groups.append(filtered_cells)
+
+        if len(index_condition_groups) > 0:
+            filtering_result: list[TableBTreeLeafCell] = index_condition_groups[0]
+            for group in index_condition_groups[1:]:
+                for cell in filtering_result:
+                    if cell not in group:
+                        filtering_result.remove(cell)
+
+            linear_row_leaf_cells = iter(filtering_result)
+
+        record_from_token = self._record_extractor(db_encoding, schema_column_names)
+        for leaf_cell in linear_row_leaf_cells:
             payload = self._load_full_payload(leaf_cell)
-            row_record = parse_records(payload)
+            row_records = parse_records(payload)
 
             matching_row = True
             for left_token_arg, right_token_arg in conditions:
-                left_record_value = record_from_token(left_token_arg)
-                right_record_value = record_from_token(right_token_arg)
+                left_record_value = record_from_token(left_token_arg, row_records)
+                right_record_value = record_from_token(right_token_arg, row_records)
 
                 if left_record_value != right_record_value:
                     matching_row = False
@@ -286,9 +485,9 @@ class SQLiteDatabase:
 
             result: list[str] = []
             for index in selected_column_indices:
-                if index == 0 and row_record[index].type == SerialType.NULL:
+                if index == 0 and row_records[index].type == SerialType.NULL:
                     result.append(str(leaf_cell.row_id))
                 else:
-                    result.append(row_record[index].data.decode(db_encoding))
+                    result.append(row_records[index].data.decode(db_encoding))
 
             yield result

@@ -11,14 +11,18 @@ with SQLiteDatabase(database_file_path) as database:
     match (command[0] == "."), command:
         case True, ".dbinfo":
             db_header = database.header()
-            schema_tables = list(database.schema_tables())
+            schema_tables = list(database.schema_objects())
 
             print(f"database page size: {db_header.page_size}")
             print(f"number of tables: {len(schema_tables)}")
 
         case True, ".tables":
             table_names = sorted(
-                [schema_table.tbl_name for schema_table in database.schema_tables()]
+                [
+                    schema_table.tbl_name
+                    for schema_table in database.schema_objects()
+                    if schema_table.is_table
+                ]
             )
             print(" ".join(table_names))
 

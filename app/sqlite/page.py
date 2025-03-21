@@ -123,13 +123,19 @@ class BTreePage:
             cell_pointer_offset += 2
 
     def cells(self) -> Iterable[AnyBTreeCell]:
+        cell_pointers = list(self._cell_pointers())
         asc_sorted_cell_pointers = sorted(self._cell_pointers())
 
+        start_to_end_map: dict[int, int] = {}
         for cell_start, cell_end in zip(
-            reversed(asc_sorted_cell_pointers),
-            reversed([*asc_sorted_cell_pointers[1:], len(self._page_data)]),
+            asc_sorted_cell_pointers,
+            [*asc_sorted_cell_pointers[1:], len(self._page_data)],
             strict=True,
         ):
+            start_to_end_map[cell_start] = cell_end
+
+        for cell_start in cell_pointers:
+            cell_end = start_to_end_map[cell_start]
             raw_bytes = BytesOffsetArray(self._page_data[cell_start:cell_end])
 
             match self.header.page_type:
